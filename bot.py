@@ -1,17 +1,58 @@
 import os
 import re
+import ssl
 from datetime import datetime
+
+import certifi
+
+# Configure SSL to use certifi's certificate bundle (fixes macOS SSL issues)
+# This must be done BEFORE importing discord/aiohttp
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+# Patch aiohttp to use certifi's certificates
+import aiohttp
+
+# Create SSL context with certifi's certificate bundle
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+# Patch aiohttp's default connector to use our SSL context
+original_connector_init = aiohttp.TCPConnector.__init__
+
+def patched_connector_init(self, *args, **kwargs):
+    if 'ssl' not in kwargs or kwargs['ssl'] is True:
+        kwargs['ssl'] = ssl_context
+    return original_connector_init(self, *args, **kwargs)
+
+aiohttp.TCPConnector.__init__ = patched_connector_init
 
 import discord
 from dotenv import load_dotenv
 
 from google_sheets import append_inventory_row, mark_return
 
+# Load .env locally (Railway will ignore this and use its own env vars)
 load_dotenv()
 
+# Read env vars
 TOKEN = os.getenv("DISCORD_TOKEN")
-INVENTORY_CHANNEL_ID = int(os.getenv("INVENTORY_CHANNEL_ID"))
+CHANNEL_ID_RAW = os.getenv("INVENTORY_CHANNEL_ID")
 
+print("Token length:", len(TOKEN) if TOKEN else "None")
+print("Inventory channel raw:", CHANNEL_ID_RAW)
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is not set or empty")
+
+if not CHANNEL_ID_RAW:
+    raise RuntimeError("INVENTORY_CHANNEL_ID is not set or empty")
+
+try:
+    INVENTORY_CHANNEL_ID = int(CHANNEL_ID_RAW)
+except ValueError:
+    raise RuntimeError("INVENTORY_CHANNEL_ID must be a numeric ID string")
+
+# Discord intents
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -35,7 +76,7 @@ RETURN_PATTERN = re.compile(
 )
 
 
-def parse_date(date_str: str):
+def parse_date(date_str):
     date_str = date_str.strip()
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
@@ -62,10 +103,12 @@ async def on_ready():
 
 
 @client.event
-async def on_message(message: discord.Message):
+async def on_message(message):
+    # ignore bot itself
     if message.author == client.user:
         return
 
+    # only watch the inventory channel
     if message.channel.id != INVENTORY_CHANNEL_ID:
         return
 
@@ -118,7 +161,11 @@ async def on_message(message: discord.Message):
         message_link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{message.id}"
 
         try:
-            ok = mark_return(serial=serial, returned_by=returned_by, return_message_link=message_link)
+            ok = mark_return(
+                serial=serial,
+                returned_by=returned_by,
+                return_message_link=message_link,
+            )
             if ok:
                 await message.add_reaction("🔁")
             else:
@@ -137,3 +184,6 @@ async def on_message(message: discord.Message):
         await message.reply(BORROW_HELP)
     elif content_lower.startswith("return"):
         await message.reply(RETURN_HELP)
+
+
+client.run(TOKEN)
